@@ -22,7 +22,7 @@ This repository ships two parallel builds, since QGIS 4.0 "Norrköping"
 | Folder | For | 
 |---|---|
 | [`qgis3/`](qgis3/) | QGIS 3.34 up to 3.99 (Qt5) |
-| [`qgis4/`](qgis4/) | QGIS 4.0 and later (Qt6) — see [`qgis4/README.md`](qgis4/README.md) for exactly what changed and why |
+| [`qgis4/`](qgis4/) | QGIS 4.0 and later (Qt6) |
 
 Each folder contains a self-contained `sc4_terrain_composer/` plugin
 directory — zip *that* subfolder (with itself as the ZIP's top level) to
