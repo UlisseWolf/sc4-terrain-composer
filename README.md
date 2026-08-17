@@ -3,7 +3,7 @@
 **A QGIS plugin for composing and exporting DEM heightmaps for SimCity 4
 (SC4Mapper) and OpenTTD.**
 
-`QGIS 3.34+` · `Python 3` · `License: MIT`
+`QGIS 3.34+ / 4.0+` · `Python 3` · `License: MIT`
 
 SC4 Terrain Composer turns a DEM mosaic into a game-ready heightmap
 without leaving QGIS or touching an image editor. It automatically finds
@@ -12,6 +12,25 @@ fragments), lets you pick which ones to keep, move, rotate or delete them
 with seamless blending, and exports an 8-bit BMP or PNG that matches
 SC4Mapper's and OpenTTD's exact elevation-encoding rules — rules that were
 reverse-engineered directly from SC4Mapper's own source code, not guessed.
+
+## Which folder do I need?
+
+This repository ships two parallel builds, since QGIS 4.0 "Norrköping"
+(March 2026) moved from Qt5 to Qt6 and old-style Qt enum access
+(`Qt.UserRole`) breaks under it:
+
+| Folder | For | 
+|---|---|
+| [`qgis3/`](qgis3/) | QGIS 3.34 up to 3.99 (Qt5) |
+| [`qgis4/`](qgis4/) | QGIS 4.0 and later (Qt6) — see [`qgis4/README.md`](qgis4/README.md) for exactly what changed and why |
+
+Each folder contains a self-contained `sc4_terrain_composer/` plugin
+directory — zip *that* subfolder (with itself as the ZIP's top level) to
+install via **Plugins → Manage and Install Plugins → Install from ZIP**.
+`terrain_ops.py`, `raster_io.py` and `map_tools.py` are byte-identical
+between the two builds; only `dock_widget.py`, `sc4_terrain_composer.py`
+and `metadata.txt` differ, for the Qt6 enum-scoping reasons documented in
+`qgis4/README.md`.
 
 ## Why this exists
 
@@ -48,29 +67,47 @@ directly to a format your target game will accept.
   rectangle before you generate the file.
 - **SC4 export** — 8-bit BMP snapped to the `64x+1` / `256x+1` dimensions
   SC4 requires, with the exact scale-factor presets from SC4Mapper's own
-  source code, automatic scale adjustment when the terrain would
-  otherwise be clipped, and a configurable coastal offset that
-  compensates for SC4Mapper's fixed water-rendering threshold (see
-  [Technical notes](#technical-notes) below).
+  source code and automatic scale adjustment when the terrain would
+  otherwise be clipped. Includes a **coastal offset** option that
+  compensates for a real, source-verified SC4Mapper behavior: it renders
+  any exported land below 25 real meters of elevation as submerged,
+  regardless of the chosen scale factor (see
+  [Technical notes](#technical-notes)).
 - **OpenTTD export** — 8-bit PNG snapped to a power-of-2 size (up to
   16384 with extended-limit clients such as JGRPP), black = sea level,
   white = the chosen maximum elevation.
+- **OpenTTD town data export** — exports a point layer (e.g. loaded from
+  OpenStreetMap via QuickOSM) as OpenTTD's *official* town-import JSON
+  format (`Scenario Editor → Town Generation → Load from file`), with
+  each town's tile position computed through the exact same crop/
+  rotation pipeline as the heightmap export, so they land in the right
+  spot even on a rotated or cropped map.
+- **Linked vector layer** — optionally, moving or rotating a piece of
+  terrain also moves/rotates any point feature (e.g. a town marker) that
+  currently sits on top of it, by the identical transform, using the
+  same underlying math validated for the heightmap and JSON exports.
 
 ## Installation
 
-1. Download the latest release ZIP (or clone this repository and zip the
-   `sc4_terrain_composer/` folder yourself, with that folder as the
-   ZIP's top level).
-2. In QGIS: **Plugins → Manage and Install Plugins → Install from ZIP**,
+1. Pick the right folder for your QGIS version (see
+   [Which folder do I need?](#which-folder-do-i-need) above) — `qgis3/`
+   or `qgis4/`.
+2. Clone this repository, or download it as a ZIP and extract it, then
+   zip *that* folder's `sc4_terrain_composer/` subfolder on its own
+   (with itself as the new ZIP's top level).
+3. In QGIS: **Plugins → Manage and Install Plugins → Install from ZIP**,
    select the file.
-3. Enable the plugin from the list if it doesn't activate automatically.
-4. A toolbar icon / menu entry **"SC4 Terrain Composer"** appears and
+4. Enable the plugin from the list if it doesn't activate automatically.
+5. A toolbar icon / menu entry **"SC4 Terrain Composer"** appears and
    opens the side panel.
 
-For development, you can instead symlink or copy `sc4_terrain_composer/`
-directly into QGIS's plugin profile folder (on Windows, typically
-`C:\Users\<you>\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\`),
-then enable it from **Plugins → Manage and Install Plugins → Installed**.
+For development, you can instead symlink or copy the matching
+`sc4_terrain_composer/` folder directly into QGIS's plugin profile
+folder (on Windows, typically
+`C:\Users\<you>\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\`
+for QGIS 3.x — the QGIS 4.x path uses a similar layout under its own
+profile directory), then enable it from **Plugins → Manage and Install
+Plugins → Installed**.
 
 ## Basic workflow
 
@@ -138,10 +175,12 @@ that runs standalone:
 python3 test_terrain_ops.py
 ```
 
-No QGIS installation is required to run these tests. The PyQGIS
-integration layer (`dock_widget.py`, `raster_io.py`, `map_tools.py`,
-`sc4_terrain_composer.py`) depends on QGIS and GDAL's Python bindings and
-is exercised inside QGIS itself.
+No QGIS installation is required to run these tests (36 checks, covering
+masks, feathering, inpainting, move/rotate math, SC4/OpenTTD encoding,
+export-geometry consistency, and point-tracking through the export
+pipeline). The PyQGIS integration layer (`dock_widget.py`, `raster_io.py`,
+`map_tools.py`, `sc4_terrain_composer.py`) depends on QGIS and GDAL's
+Python bindings and is exercised inside QGIS itself.
 
 ## Known limitations
 

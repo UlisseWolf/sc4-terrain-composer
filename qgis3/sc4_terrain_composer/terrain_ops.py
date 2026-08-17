@@ -250,6 +250,61 @@ def mask_center(mask: np.ndarray, shape=None):
     return (r0 + r1 - 1) / 2.0, (c0 + c1 - 1) / 2.0
 
 
+def transform_points_with_move(points_rc, selection_mask: np.ndarray,
+                                dst_row_offset: int, dst_col_offset: int,
+                                rotation_degrees: float = 0.0):
+    """Applies the SAME move/rotate transform that move_region() applies
+    to raster pixels, to a list of (row, col) points instead — keeps a
+    linked vector layer (e.g. town markers) in sync when a piece of
+    terrain is moved or rotated.
+
+    A point counts as 'part of the moved selection' if its (rounded)
+    pixel position falls inside selection_mask; such points are rotated
+    about the SAME center mask_center() computes for move_region()
+    (guaranteeing the two stay geometrically consistent — this is the
+    same 'single source of truth' principle already used for
+    prepare_export's point tracking, for the same reason: two
+    independent reimplementations of a crop/rotate transform have
+    drifted apart before in this project) and then offset by
+    (dst_row_offset, dst_col_offset). Points outside the selection are
+    returned completely unchanged — moving one piece of terrain must not
+    silently drag along a town that happens to sit elsewhere on the map.
+
+    points_rc: list of (row, col) tuples (or None entries, passed through
+    unchanged) in the raster's pixel coordinates. Returns a new list,
+    same length and order."""
+    h, w = selection_mask.shape
+    center = mask_center(selection_mask) if abs(rotation_degrees) > 1e-6 else None
+    rad = np.deg2rad(rotation_degrees)
+    cos_a, sin_a = np.cos(rad), np.sin(rad)
+
+    out = []
+    for p in points_rc:
+        if p is None:
+            out.append(None)
+            continue
+        row, col = p
+        ir, ic = int(round(row)), int(round(col))
+        inside = 0 <= ir < h and 0 <= ic < w and bool(selection_mask[ir, ic])
+        if not inside:
+            out.append((row, col))
+            continue
+
+        nr, nc = row, col
+        if center is not None:
+            cy, cx = center
+            y0, x0 = row - cy, col - cx
+            # same forward-rotation convention as everywhere else in this
+            # module: positive angle = clockwise on screen
+            x1 = x0 * cos_a - y0 * sin_a
+            y1 = x0 * sin_a + y0 * cos_a
+            nr, nc = y1 + cy, x1 + cx
+        nr += dst_row_offset
+        nc += dst_col_offset
+        out.append((nr, nc))
+    return out
+
+
 def selection_bbox(mask: np.ndarray, feather_px: int = 6, margin: int = None, shape=None):
     """Public wrapper around _bbox_of_mask: also used outside this module
     (by the plugin) to know WHICH area an operation will touch before
@@ -580,6 +635,121 @@ def autocrop_to_content(dem: np.ndarray, sea_level: float = 0.0, margin_px: int 
         return dem.astype(WORK_DTYPE), None
     r0, r1, c0, c1 = bbox
     return dem[r0:r1, c0:c1].astype(WORK_DTYPE), bbox
+
+
+def prepare_export(dem: np.ndarray, sea_level: float = 0.0, rotation_degrees: float = 0.0,
+                    do_autocrop: bool = True, target_w: int = None, target_h: int = None,
+                    points_rc=None, max_intermediate_dim: int = 4096, resample_fn=None):
+    """Runs the SAME crop → (optional downsample) → rotate → crop
+    pipeline used for SC4/OpenTTD export, and — if points_rc is given —
+    tracks a list of (row, col) points (in the ORIGINAL dem's pixel
+    coordinates) through every single step of that pipeline.
+
+    This exists so that markers placed on the exported image (e.g. town
+    positions for the OpenTTD JSON export) are GUARANTEED to line up
+    with the actual pixel data: reimplementing the same crop/rotate/crop
+    sequence a second time in a different function would risk the two
+    drifting apart after a future change to one but not the other — a
+    real class of bug already hit more than once in this project.
+
+    resample_fn: callable(array2d, target_w, target_h) -> resampled
+    array2d, used ONLY for the optional pre-rotation downsample
+    (performance optimization on a large DEM). Needs GDAL, so it's
+    injected by the caller (raster_io.resample_array) rather than
+    imported here — keeps this module pure numpy and testable without
+    QGIS/GDAL. If None, that downsample step is simply skipped (rotation
+    then runs at full resolution — fine for tests or small crops).
+
+    Returns (array, mapped_points, info_text). mapped_points is a list
+    the same length as points_rc, in the RETURNED array's own pixel
+    coordinates (not yet the target_w x target_h final size — the
+    caller applies that last resample to both the array and these
+    points identically, since that step doesn't need GDAL for the
+    points, just a linear rescale). A point that fell outside the
+    final cropped area at any step becomes None."""
+    array = dem.astype(WORK_DTYPE).copy()
+    original_shape = array.shape
+    info_parts = []
+
+    pts = None
+    if points_rc is not None:
+        pts = [None if p is None else (float(p[0]), float(p[1])) for p in points_rc]
+
+    def _clip_points(bbox):
+        nonlocal pts
+        if pts is None or bbox is None:
+            return
+        r0, r1, c0, c1 = bbox
+        new_pts = []
+        for p in pts:
+            if p is None:
+                new_pts.append(None)
+                continue
+            pr, pc = p
+            if r0 <= pr < r1 and c0 <= pc < c1:
+                new_pts.append((pr - r0, pc - c0))
+            else:
+                new_pts.append(None)
+        pts = new_pts
+
+    if do_autocrop or abs(rotation_degrees) > 1e-6:
+        if abs(rotation_degrees) > 1e-6:
+            array, bbox, center_yx = autocrop_to_content_rotation_safe(array, sea_level, rotation_degrees)
+            if bbox is None:
+                return array, ([None] * len(pts) if pts is not None else None), "no land found"
+            _clip_points(bbox)
+
+            if target_w and target_h and resample_fn is not None:
+                longest_target = max(target_w, target_h)
+                work_w = min(array.shape[1], longest_target * 2, max_intermediate_dim)
+                if work_w < array.shape[1]:
+                    work_h = max(1, int(round(array.shape[0] * work_w / array.shape[1])))
+                    scale_y = work_h / array.shape[0]
+                    scale_x = work_w / array.shape[1]
+                    array = resample_fn(array, work_w, work_h)
+                    center_yx = (center_yx[0] * scale_y, center_yx[1] * scale_x)
+                    if pts is not None:
+                        pts = [None if p is None else (p[0] * scale_y, p[1] * scale_x) for p in pts]
+                    info_parts.append(f"resampled to {work_w}x{work_h} px before "
+                                       f"rotating (faster; the final export size "
+                                       f"doesn't change)")
+
+            array = rotate_full(array, rotation_degrees, center_yx=center_yx)
+            if pts is not None:
+                cy, cx = center_yx
+                rad = np.deg2rad(rotation_degrees)
+                cos_a, sin_a = np.cos(rad), np.sin(rad)
+                h, w = array.shape
+                new_pts = []
+                for p in pts:
+                    if p is None:
+                        new_pts.append(None)
+                        continue
+                    # forward mapping (same convention as rotate_crop):
+                    # where a source point ends up in the rotated frame
+                    y0, x0 = p[0] - cy, p[1] - cx
+                    x1 = x0 * cos_a - y0 * sin_a
+                    y1 = x0 * sin_a + y0 * cos_a
+                    ny, nx = y1 + cy, x1 + cx
+                    new_pts.append((ny, nx) if (0 <= ny < h and 0 <= nx < w) else None)
+                pts = new_pts
+
+            info_parts.append(f"rotated by {rotation_degrees:.0f}° (export only, "
+                               f"the working DEM stays unchanged)")
+
+            if do_autocrop:
+                array, bbox2 = autocrop_to_content(array, sea_level, margin_px=0)
+                _clip_points(bbox2)
+        else:
+            array, bbox = autocrop_to_content(array, sea_level, margin_px=0)
+            _clip_points(bbox)
+
+        if do_autocrop:
+            info_parts.append(f"cropped from {original_shape[1]}x{original_shape[0]} "
+                               f"to {array.shape[1]}x{array.shape[0]} px")
+
+    info_text = "; ".join(info_parts) if info_parts else "no pre-processing applied"
+    return array, pts, info_text
 
 
 def rotate_full(dem: np.ndarray, angle_degrees: float, center_yx=None) -> np.ndarray:
