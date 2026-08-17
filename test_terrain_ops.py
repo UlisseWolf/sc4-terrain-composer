@@ -1,6 +1,11 @@
 import numpy as np
 import sys
-sys.path.insert(0, "sc4_terrain_composer")
+# terrain_ops.py has no Qt/QGIS dependency and is byte-identical between
+# the qgis3/ and qgis4/ builds (only dock_widget.py and
+# sc4_terrain_composer.py differ, for Qt6 enum-scoping reasons — see
+# qgis4/README.md) — testing against the qgis3 copy exercises the exact
+# same code the qgis4 build ships too.
+sys.path.insert(0, "qgis3/sc4_terrain_composer")
 from terrain_ops import (
     build_land_mask, feather_mask, box_blur, gaussian_like_blur,
     inpaint_fill, move_region, delete_region,
@@ -10,7 +15,7 @@ from terrain_ops import (
     elevation_to_openttd_gray, force_sea_level_border, nearest_openttd_size,
     autocrop_to_content, rotate_full, find_optimal_rotation,
     compute_export_bbox_corners, autocrop_to_content_rotation_safe,
-    rotation_padding_needed,
+    rotation_padding_needed, prepare_export, transform_points_with_move,
 )
 
 
@@ -179,6 +184,51 @@ def test_sc4_water_threshold_and_coastal_offset():
           f"0m decodes to {reconstructed_with_offset[0]:.1f}m (at/above threshold)")
 
 
+def test_prepare_export_no_processing_leaves_points_unchanged():
+    dem = np.zeros((200, 200))
+    dem[50:150, 50:150] = 300
+    arr, pts, info = prepare_export(dem, sea_level=0, rotation_degrees=0, do_autocrop=False,
+                                     points_rc=[(100, 100), (5, 5)])
+    assert pts == [(100.0, 100.0), (5.0, 5.0)]
+    print("OK prepare_export with no processing leaves points unchanged")
+
+
+def test_prepare_export_crop_only_shifts_and_clips_points():
+    dem = np.zeros((200, 200))
+    dem[50:150, 50:150] = 300
+    arr, pts, info = prepare_export(dem, sea_level=0, rotation_degrees=0, do_autocrop=True,
+                                     points_rc=[(100, 100), (0, 0)])
+    _, bbox = autocrop_to_content(dem, sea_level=0, margin_px=0)
+    r0, c0 = bbox[0], bbox[2]
+    assert abs(pts[0][0] - (100 - r0)) < 1e-6 and abs(pts[0][1] - (100 - c0)) < 1e-6
+    assert pts[1] is None  # (0,0) falls outside the crop
+    print(f"OK prepare_export crop-only (bbox={bbox}, point shifted correctly, "
+          f"out-of-bounds point became None)")
+
+
+def test_prepare_export_marker_matches_real_pixel_after_rotation():
+    # the strongest possible check: place a distinguishable marker in the
+    # DEM at a known point, run it through prepare_export ALONGSIDE that
+    # same point as points_rc, and verify the returned point coincides
+    # with where the marker pixel actually ended up in the transformed
+    # array — guarantees the point-tracking math stays in sync with the
+    # real array transform, not just internally self-consistent
+    dem = np.zeros((400, 400))
+    dem[150:250, 100:350] = 300.0  # off-center, non-square shape
+    marker_row, marker_col = 180, 320
+    dem[marker_row, marker_col] = 900.0  # distinguishable marker
+
+    angle = 23.0
+    arr, pts, info = prepare_export(dem, sea_level=0, rotation_degrees=angle, do_autocrop=True,
+                                     points_rc=[(marker_row, marker_col)])
+    tracked = pts[0]
+    ry, rx = np.unravel_index(np.argmax(arr), arr.shape)
+    dist = np.hypot(tracked[0] - ry, tracked[1] - rx)
+    print(f"OK prepare_export marker tracking after {angle}° rotation: "
+          f"tracked point={tracked}, real marker pixel=({ry},{rx}), distance={dist:.2f}px")
+    assert dist < 2.0
+
+
 def test_rotate_crop_90_degrees():
     arr = np.zeros((21, 21), dtype=np.float64)
     arr[10, 15] = 100.0  # point to the right of the center (10,10), same row
@@ -258,6 +308,43 @@ def test_rotate_small_angle_on_elongated_selection_no_clipping():
         assert all_inside, f"angle {angle}°: a corner of the rotated shape falls outside the bbox {bbox}"
     print("OK no geometric clipping for an elongated selection at 5°/15°/45°/90° "
           "(rotated shape's corners always inside the computed box)")
+
+
+def test_transform_points_with_move_pure_translation():
+    mask = np.zeros((200, 200), dtype=bool)
+    mask[50:100, 60:140] = True
+    pts = [(70, 90), (10, 10)]  # first INSIDE the selection, second OUTSIDE
+    out = transform_points_with_move(pts, mask, dst_row_offset=30, dst_col_offset=-20,
+                                      rotation_degrees=0.0)
+    assert out[0] == (100, 70)
+    assert out[1] == (10, 10)  # untouched: not part of the moved selection
+    print("OK transform_points_with_move (pure translation): point inside moved, "
+          "point outside left untouched")
+
+
+def test_transform_points_with_move_matches_real_rotated_pixel():
+    # strongest possible check, same principle as prepare_export's marker
+    # test: place a marker in the RASTER at a known point, rotate it with
+    # move_region, and verify a VECTOR point at that same original
+    # location ends up exactly where the real marker pixel landed
+    mask = np.zeros((200, 200), dtype=bool)
+    mask[50:100, 60:140] = True
+    dem = np.zeros((200, 200))
+    dem[50:100, 60:140] = 300.0
+    dem[70, 135] = 900.0
+
+    angle = 40.0
+    rotated = move_region(dem, mask, dst_row_offset=0, dst_col_offset=0, rotation_degrees=angle,
+                           feather_px=4, inpaint_iterations=300)
+    ry, rx = np.unravel_index(np.argmax(rotated), rotated.shape)
+
+    out = transform_points_with_move([(70, 135)], mask, dst_row_offset=0, dst_col_offset=0,
+                                      rotation_degrees=angle)
+    tracked = out[0]
+    dist = np.hypot(tracked[0] - ry, tracked[1] - rx)
+    print(f"OK transform_points_with_move matches the real rotated raster pixel "
+          f"(tracked={tracked}, real marker=({ry},{rx}), distance={dist:.2f}px)")
+    assert dist < 2.0
 
 
 def test_move_region_with_rotation_in_place():
@@ -356,7 +443,7 @@ def test_save_uint8_bmp_readable_by_pillow():
         sys.modules["osgeo.gdal"] = fake_gdal
         sys.modules["osgeo.osr"] = fake_osr
 
-    sys.path.insert(0, "sc4_terrain_composer")
+    sys.path.insert(0, "qgis3/sc4_terrain_composer")
     from raster_io import save_uint8_bmp
     from PIL import Image
 
@@ -406,7 +493,7 @@ def test_estimate_utm_epsg_global_cases():
         sys.modules["osgeo.gdal"] = fake_gdal
         sys.modules["osgeo.osr"] = fake_osr
 
-    sys.path.insert(0, "sc4_terrain_composer")
+    sys.path.insert(0, "qgis3/sc4_terrain_composer")
     from raster_io import estimate_utm_epsg
     cases = [
         ((16.6, 38.1), 32633, "Calabria"),
@@ -662,6 +749,11 @@ if __name__ == "__main__":
     test_move_region_relocates_island_without_seam()
     test_sc4_encoding_and_scale_suggestion()
     test_sc4_water_threshold_and_coastal_offset()
+    test_prepare_export_no_processing_leaves_points_unchanged()
+    test_prepare_export_crop_only_shifts_and_clips_points()
+    test_prepare_export_marker_matches_real_pixel_after_rotation()
+    test_transform_points_with_move_pure_translation()
+    test_transform_points_with_move_matches_real_rotated_pixel()
     test_rotate_crop_90_degrees()
     test_rotate_crop_360_returns_close_to_original()
     test_rotation_safe_bbox_bigger_than_normal_when_rotating()

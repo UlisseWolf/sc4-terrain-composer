@@ -23,6 +23,7 @@ that logic to the UI and to QGIS.
 import os
 import copy
 import tempfile
+import json
 import numpy as np
 
 from qgis.PyQt.QtWidgets import (
@@ -35,7 +36,7 @@ from qgis.core import (
     QgsProject, QgsRasterLayer, QgsVectorLayer, QgsField, QgsFeature,
     QgsGeometry, QgsWkbTypes, QgsFillSymbol, QgsCategorizedSymbolRenderer,
     QgsRendererCategory, QgsRandomColorRamp, edit, QgsCoordinateTransform,
-    QgsPointXY,
+    QgsPointXY, QgsMapLayerProxyModel,
 )
 from qgis.PyQt.QtCore import QVariant, Qt
 from osgeo import gdal, ogr
@@ -46,7 +47,7 @@ from .raster_io import (
     resample_array, mosaic_tiles_auto_utm, sieve_small_land,
 )
 from .map_tools import PointPickTool
-from qgis.gui import QgsRubberBand
+from qgis.gui import QgsRubberBand, QgsMapLayerComboBox
 
 MAX_UNDO_STATES = 25
 
@@ -302,6 +303,19 @@ class Sc4TerrainComposerDock(QDockWidget):
         )
         form.addRow("Rotation:", self.spin_rotation)
 
+        self.combo_linked_vector_layer = QgsMapLayerComboBox()
+        self.combo_linked_vector_layer.setFilters(QgsMapLayerProxyModel.PointLayer)
+        self.combo_linked_vector_layer.setAllowEmptyLayer(True)
+        self.combo_linked_vector_layer.setToolTip(
+            "Optional. If set, moving or rotating a raster selection also "
+            "moves/rotates — by the EXACT same transform — any point "
+            "feature from this layer that currently falls inside the "
+            "selection (e.g. town markers sitting on the piece of "
+            "terrain you're relocating). Features outside the selection "
+            "are never touched. The layer is edited and saved directly."
+        )
+        form.addRow("Linked vector layer (optional):", self.combo_linked_vector_layer)
+
         btn_move = QPushButton("Move selection (then click the destination)")
         btn_move.clicked.connect(self.start_move)
         form.addRow(btn_move)
@@ -521,6 +535,66 @@ class Sc4TerrainComposerDock(QDockWidget):
         btn_export_ottd = QPushButton("Export 8-bit PNG for OpenTTD...")
         btn_export_ottd.clicked.connect(self.export_openttd)
         form.addRow(btn_export_ottd)
+
+        note_towns = QLabel("<b>Towns (optional)</b>")
+        form.addRow(note_towns)
+
+        self.combo_towns_layer = QgsMapLayerComboBox()
+        self.combo_towns_layer.setFilters(QgsMapLayerProxyModel.PointLayer)
+        self.combo_towns_layer.setAllowEmptyLayer(True)
+        self.combo_towns_layer.setToolTip(
+            "A point vector layer with town/city locations (e.g. loaded "
+            "via QuickOSM, or any 'populated places' dataset already in "
+            "the project). Only the ones that fall inside the exported "
+            "area are included."
+        )
+        self.combo_towns_layer.layerChanged.connect(self._refresh_towns_field_combo)
+        form.addRow("Towns layer:", self.combo_towns_layer)
+
+        self.combo_towns_field = QComboBox()
+        self.combo_towns_field.setToolTip("Attribute field that holds each town's name.")
+        form.addRow("Name field:", self.combo_towns_field)
+
+        self.combo_towns_pop_field = QComboBox()
+        self.combo_towns_pop_field.setToolTip(
+            "Optional. Attribute field with population figures. If left "
+            "empty (or set to '(none)'), every town uses the default "
+            "population below instead."
+        )
+        form.addRow("Population field (optional):", self.combo_towns_pop_field)
+
+        self.spin_towns_default_pop = QSpinBox()
+        self.spin_towns_default_pop.setRange(1, 1000000)
+        self.spin_towns_default_pop.setValue(1000)
+        self.spin_towns_default_pop.setToolTip(
+            "Used for towns with no population value (missing field, or "
+            "no population field selected). OpenTTD scales this down "
+            "internally, so it doesn't need to match a real-world figure "
+            "exactly."
+        )
+        form.addRow("Default population:", self.spin_towns_default_pop)
+
+        self.spin_towns_city_threshold = QSpinBox()
+        self.spin_towns_city_threshold.setRange(0, 1000000)
+        self.spin_towns_city_threshold.setValue(5000)
+        self.spin_towns_city_threshold.setToolTip(
+            "Towns with a population at or above this value are marked "
+            "as 'city' (grows faster, larger max size) in OpenTTD's "
+            "import format."
+        )
+        form.addRow("City population threshold:", self.spin_towns_city_threshold)
+
+        btn_export_towns = QPushButton("Export towns JSON...")
+        btn_export_towns.clicked.connect(self.export_openttd_towns_json)
+        btn_export_towns.setToolTip(
+            "Exports the towns from the selected layer in OpenTTD's "
+            "official town-data JSON format (Scenario Editor → Town "
+            "Generation → Load from file), computed through the SAME "
+            "crop/rotation pipeline as the PNG above — so they line up "
+            "with the heightmap even if you rotated or cropped the "
+            "export."
+        )
+        form.addRow(btn_export_towns)
 
         return self._wrap_scroll(root)
 
@@ -925,9 +999,72 @@ class Sc4TerrainComposerDock(QDockWidget):
             rotation_degrees=rotation,
         )
         self._commit_array(new_array)
+        moved_pts = self._move_linked_vector_points(dr, dc, rotation)
         self.current_mask = None
-        self.lbl_mask.setText("Move applied." if abs(rotation) < 1e-6
-                               else f"Move + rotation of {rotation}° applied.")
+        msg = "Move applied." if abs(rotation) < 1e-6 else f"Move + rotation of {rotation}° applied."
+        if moved_pts:
+            msg += f" ({moved_pts} linked point(s) moved too.)"
+        self.lbl_mask.setText(msg)
+
+    def _move_linked_vector_points(self, dst_row_offset: int, dst_col_offset: int,
+                                    rotation_degrees: float) -> int:
+        """Moves/rotates any point feature from the layer selected in
+        'Linked vector layer' that currently falls inside self.current_mask,
+        by the EXACT same transform just applied to the raster (see
+        terrain_ops.transform_points_with_move). Features outside the
+        selection are left untouched. Returns how many features moved."""
+        layer = self.combo_linked_vector_layer.currentLayer()
+        if layer is None or self.current_mask is None:
+            return 0
+
+        raster_crs = self.raster_layer.crs()
+        layer_crs = layer.crs()
+        to_raster = (QgsCoordinateTransform(layer_crs, raster_crs, QgsProject.instance())
+                     if layer_crs != raster_crs else None)
+        to_layer = (QgsCoordinateTransform(raster_crs, layer_crs, QgsProject.instance())
+                    if layer_crs != raster_crs else None)
+
+        feat_ids, points_rc = [], []
+        for feat in layer.getFeatures():
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            pt = geom.centroid().asPoint()
+            if to_raster is not None:
+                try:
+                    pt = to_raster.transform(pt)
+                except Exception:
+                    continue
+            col, row = self.raster.geo_to_pixel(pt.x(), pt.y())
+            feat_ids.append(feat.id())
+            points_rc.append((row, col))
+
+        if not points_rc:
+            return 0
+
+        new_points = terrain_ops.transform_points_with_move(
+            points_rc, self.current_mask, dst_row_offset, dst_col_offset, rotation_degrees)
+
+        was_editing = layer.isEditable()
+        if not was_editing:
+            layer.startEditing()
+
+        moved_count = 0
+        for fid, old_pt, new_pt in zip(feat_ids, points_rc, new_points):
+            if new_pt == old_pt:
+                continue  # unchanged: this feature wasn't inside the selection
+            x, y = self.raster.pixel_to_geo(new_pt[1], new_pt[0])
+            map_point = QgsPointXY(x, y)
+            if to_layer is not None:
+                map_point = to_layer.transform(map_point)
+            layer.changeGeometry(fid, QgsGeometry.fromPointXY(map_point))
+            moved_count += 1
+
+        if not was_editing:
+            layer.commitChanges()
+        else:
+            layer.triggerRepaint()
+        return moved_count
 
     def rotate_selection(self):
         if self.current_mask is None:
@@ -951,8 +1088,12 @@ class Sc4TerrainComposerDock(QDockWidget):
             rotation_degrees=rotation,
         )
         self._commit_array(new_array)
+        moved_pts = self._move_linked_vector_points(0, 0, rotation)
         self.current_mask = None
-        self.lbl_mask.setText(f"Rotation of {rotation}° applied (in place).")
+        msg = f"Rotation of {rotation}° applied (in place)."
+        if moved_pts:
+            msg += f" ({moved_pts} linked point(s) rotated too.)"
+        self.lbl_mask.setText(msg)
 
     def delete_selection(self):
         if self.current_mask is None:
@@ -1045,84 +1186,25 @@ class Sc4TerrainComposerDock(QDockWidget):
     # ------------------------------------------------------------------
     # 4. SC4 export
     # ------------------------------------------------------------------
-    def _prepare_export_array(self, target_w: int = None, target_h: int = None):
-        """Applies a clean crop of the excess sea and/or rotation SOLELY
-        to the copy used for export (tab 4) — used by both exports (SC4
-        and OpenTTD). self.raster.array is NEVER touched: the rotation
-        here can't end up 'baked into' the working data the way the old
-        whole-canvas rotation during editing could.
+    def _prepare_export_array(self, target_w: int = None, target_h: int = None, points_rc=None):
+        """Thin wrapper around terrain_ops.prepare_export: supplies the
+        current UI settings (sea level, rotation, autocrop) and the
+        GDAL-backed resample function it needs for the pre-rotation
+        downsample step. Kept as a wrapper — not duplicated logic — so
+        the image export and the towns-JSON export always go through the
+        EXACT same crop/rotate/crop pipeline; see prepare_export's
+        docstring for why that matters.
 
-        target_w/target_h (optional): final export dimensions, if known.
-        If rotation is active and the cropped content is still much
-        larger than needed, it's resampled to an intermediate resolution
-        BEFORE rotating — rotating the whole DEM at full resolution
-        (potentially tens of millions of pixels) when the final result
-        will be small anyway (a heightmap for SC4/OpenTTD is typically
-        much smaller than the DEM's native resolution) is needlessly
-        slow: a real cause of interface freezes encountered in practice
-        during export with rotation active.
-
-        Returns (ready_array, info_text) where info_text describes what
-        was done (for the final confirmation message)."""
+        Returns (ready_array, mapped_points, info_text)."""
         sea_level = self.spin_sea_level.value()
-        array = self.raster.array
-        original_shape = array.shape
-        info_parts = []
-
         rotation = self.spin_export_rotation.value()
         do_autocrop = self.chk_autocrop.isChecked()
 
-        if do_autocrop or abs(rotation) > 1e-6:
-            if abs(rotation) > 1e-6:
-                # crop with a safety margin for rotation: without it,
-                # rotate_full would cut away the part of the land that
-                # 'sticks out' of the canvas during rotation (real bug
-                # encountered: up to 20% of the mass lost in a test case,
-                # before this fix)
-                array, _, center_yx = terrain_ops.autocrop_to_content_rotation_safe(
-                    array, sea_level, rotation)
-
-                # resample to an intermediate resolution BEFORE rotating,
-                # if the final target is known and is much smaller:
-                # rotate_full costs proportionally to the size of the
-                # array it receives, not to the final result's size. The
-                # rotation center must be rescaled by the same
-                # proportion, otherwise after resampling it points to the
-                # wrong spot.
-                if target_w and target_h:
-                    longest_target = max(target_w, target_h)
-                    work_w = min(array.shape[1], longest_target * 2, 4096)
-                    if work_w < array.shape[1]:
-                        work_h = max(1, int(round(array.shape[0] * work_w / array.shape[1])))
-                        scale_y = work_h / array.shape[0]
-                        scale_x = work_w / array.shape[1]
-                        array = resample_array(array, work_w, work_h)
-                        if center_yx is not None:
-                            center_yx = (center_yx[0] * scale_y, center_yx[1] * scale_x)
-                        info_parts.append(f"resampled to {work_w}x{work_h} px before "
-                                           f"rotating (faster; the final export size "
-                                           f"doesn't change)")
-
-                # TRUE center of the content, not the crop's geometric
-                # center: if the margin above got clipped asymmetrically
-                # on one side (content close to the DEM's edge), the two
-                # centers don't coincide — using the geometric one would
-                # cut away real land during rotation (real bug
-                # encountered and fixed: the diagonal cut that ran across
-                # the mainland in the export)
-                array = terrain_ops.rotate_full(array, rotation, center_yx=center_yx)
-                info_parts.append(f"rotated by {rotation:.0f}° (export only, "
-                                   f"the working DEM stays unchanged)")
-                if do_autocrop:
-                    array, _ = terrain_ops.autocrop_to_content(array, sea_level, margin_px=0)
-            else:
-                array, _ = terrain_ops.autocrop_to_content(array, sea_level, margin_px=0)
-            if do_autocrop:
-                info_parts.append(f"cropped from {original_shape[1]}x{original_shape[0]} "
-                                   f"to {array.shape[1]}x{array.shape[0]} px")
-
-        info_text = "; ".join(info_parts) if info_parts else "no pre-processing applied"
-        return array, info_text
+        return terrain_ops.prepare_export(
+            self.raster.array, sea_level=sea_level, rotation_degrees=rotation,
+            do_autocrop=do_autocrop, target_w=target_w, target_h=target_h,
+            points_rc=points_rc, resample_fn=resample_array,
+        )
 
     def _resolve_sc4_scale(self) -> float:
         """Converts the scale-factor combo's text into a numeric value,
@@ -1153,7 +1235,7 @@ class Sc4TerrainComposerDock(QDockWidget):
         target_w = celle * n_x + 1
         target_h = celle * n_y + 1
 
-        array, prep_info = self._prepare_export_array(target_w, target_h)
+        array, _, prep_info = self._prepare_export_array(target_w, target_h)
         elev_max = float(np.nanmax(array))
         scale_factor = self._resolve_sc4_scale()
         coastal_offset = self.spin_sc4_coastal_offset.value()
@@ -1193,7 +1275,7 @@ class Sc4TerrainComposerDock(QDockWidget):
         target_h = int(self.combo_ottd_h.currentText())
         sea_level = self.spin_sea_level.value()
 
-        array, prep_info = self._prepare_export_array(target_w, target_h)
+        array, _, prep_info = self._prepare_export_array(target_w, target_h)
         elev_max_dem = float(np.nanmax(array))
         max_elev_setting = self.spin_ottd_max_elev.value()
         max_elev = elev_max_dem if max_elev_setting <= 0 else max_elev_setting
@@ -1219,4 +1301,135 @@ class Sc4TerrainComposerDock(QDockWidget):
             f"In OpenTTD: Scenario Editor → Load Heightmap, choose "
             f"{target_w}x{target_h} (or an equivalent ratio) as the map "
             f"size for a 1:1 match."
+        )
+
+    def _refresh_towns_field_combo(self, layer):
+        self.combo_towns_field.clear()
+        self.combo_towns_pop_field.clear()
+        self.combo_towns_pop_field.addItem("(none)")
+        if layer is None:
+            return
+        field_names = [f.name() for f in layer.fields()]
+        self.combo_towns_field.addItems(field_names)
+        self.combo_towns_pop_field.addItems(field_names)
+        for guess in ("name", "NAME", "Name", "town", "place", "TOWN", "settlement"):
+            if guess in field_names:
+                self.combo_towns_field.setCurrentText(guess)
+                break
+        for guess in ("population", "POPULATION", "Population", "pop", "POP"):
+            if guess in field_names:
+                self.combo_towns_pop_field.setCurrentText(guess)
+                break
+
+    def export_openttd_towns_json(self):
+        if self.raster is None:
+            QMessageBox.warning(self, "Warning", "Load a DEM first.")
+            return
+        layer = self.combo_towns_layer.currentLayer()
+        if layer is None:
+            QMessageBox.warning(self, "Warning", "Select a towns layer first.")
+            return
+        name_field = self.combo_towns_field.currentText()
+        if not name_field:
+            QMessageBox.warning(self, "Warning", "Select a name field first.")
+            return
+        pop_field = self.combo_towns_pop_field.currentText()
+        if pop_field == "(none)":
+            pop_field = None
+        default_pop = self.spin_towns_default_pop.value()
+        city_threshold = self.spin_towns_city_threshold.value()
+
+        out_path, _ = QFileDialog.getSaveFileName(self, "Export towns JSON", "", "JSON (*.json)")
+        if not out_path:
+            return
+
+        target_w = int(self.combo_ottd_w.currentText())
+        target_h = int(self.combo_ottd_h.currentText())
+
+        # collect every point (as centroid, so polygons/multipoints work
+        # too) in the raster's own pixel coordinates
+        raster_crs = self.raster_layer.crs()
+        layer_crs = layer.crs()
+        transform = None
+        if layer_crs != raster_crs:
+            transform = QgsCoordinateTransform(layer_crs, raster_crs, QgsProject.instance())
+
+        names, populations, points_rc = [], [], []
+        for feat in layer.getFeatures():
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            pt = geom.centroid().asPoint()
+            if transform is not None:
+                try:
+                    pt = transform.transform(pt)
+                except Exception:
+                    continue
+            col, row = self.raster.geo_to_pixel(pt.x(), pt.y())
+            name_val = feat[name_field]
+            names.append("" if name_val is None else str(name_val))
+            pop_val = feat[pop_field] if pop_field else None
+            try:
+                populations.append(float(pop_val) if pop_val not in (None, "") else default_pop)
+            except (TypeError, ValueError):
+                populations.append(default_pop)
+            points_rc.append((row, col))
+
+        if not points_rc:
+            QMessageBox.warning(self, "Warning", "No point features found in the selected layer.")
+            return
+
+        # runs the EXACT same crop/rotation pipeline as the PNG export
+        # above (see terrain_ops.prepare_export), so town positions stay
+        # correct even with cropping/rotation applied
+        array, mapped_points, prep_info = self._prepare_export_array(
+            target_w, target_h, points_rc=points_rc)
+
+        scale_y = target_h / array.shape[0]
+        scale_x = target_w / array.shape[1]
+
+        towns = []
+        for name, pop, pt in zip(names, populations, mapped_points):
+            if pt is None:
+                continue
+            final_row = pt[0] * scale_y
+            final_col = pt[1] * scale_x
+            if not (0 <= final_row < target_h and 0 <= final_col < target_w):
+                continue
+            # OpenTTD's official town-data format (docs/importing_town_data.md):
+            # x/y are PROPORTIONS (0-1) of the map size, and — this is the
+            # part that silently misplaces every town if missed — X and Y
+            # are SWAPPED relative to normal image coordinates ("In OpenTTD,
+            # X and Y axis are swapped compared to most image editing
+            # programs... swap them before importing or towns won't line
+            # up with your heightmap"). Since points are tracked here as
+            # (row, col), that swap falls out naturally: OpenTTD 'x' comes
+            # from the row (vertical) position, 'y' from the column
+            # (horizontal) one.
+            towns.append({
+                "name": name,
+                "population": round(pop, 2),
+                "city": pop >= city_threshold,
+                "x": final_row / target_h,
+                "y": final_col / target_w,
+            })
+
+        if not towns:
+            QMessageBox.warning(
+                self, "Warning",
+                "None of the towns in the selected layer fall inside the exported area."
+            )
+            return
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(towns, f, indent=4, ensure_ascii=False)
+
+        QMessageBox.information(
+            self, "Export complete",
+            f"Saved {len(towns)} town(s) (out of {len(points_rc)} in the "
+            f"source layer) to:\n{out_path}\n\n"
+            f"This is OpenTTD's official town-data format: in the "
+            f"Scenario Editor, after loading the matching {target_w}x{target_h} "
+            f"heightmap (clockwise rotation), open Town Generation → "
+            f"Load from file and pick this JSON."
         )
