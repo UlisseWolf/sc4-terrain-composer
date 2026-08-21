@@ -13,6 +13,8 @@ with seamless blending, and exports an 8-bit BMP or PNG that matches
 SC4Mapper's and OpenTTD's exact elevation-encoding rules — rules that were
 reverse-engineered directly from SC4Mapper's own source code, not guessed.
 
+*The tool was developed with Claude's support and under human supervision*
+
 ## Which folder do I need?
 
 This repository ships two parallel builds, since QGIS 4.0 "Norrköping"
