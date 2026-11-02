@@ -140,11 +140,10 @@ def rotation_safe_bbox(mask: np.ndarray, feather_px: int, shape, rotation_degree
     angle (standard bounding-box-of-a-rotated-rectangle formula), not the
     absolute worst case (a 90° rotation).
 
-    The worst-case margin scales with the selection's DIAGONAL: on a very
-    elongated shape (e.g. a chain of islands) it can be huge, and it used
-    to be applied even for a small rotation like 5°, where in reality a
-    much smaller margin is needed — a real, concrete cause of interface
-    freezes encountered in practice."""
+    The worst-case margin scales with the selection's diagonal: for an
+    elongated shape (e.g. a chain of islands), applying it unconditionally
+    for any nonzero rotation wastes a large amount of unnecessary padding
+    when the actual angle is small."""
     margin_base = max(feather_px * 3, 15)
     if abs(rotation_degrees) < 1e-6:
         return _bbox_of_mask(mask, margin_base, shape)
@@ -261,14 +260,13 @@ def transform_points_with_move(points_rc, selection_mask: np.ndarray,
     A point counts as 'part of the moved selection' if its (rounded)
     pixel position falls inside selection_mask; such points are rotated
     about the SAME center mask_center() computes for move_region()
-    (guaranteeing the two stay geometrically consistent — this is the
-    same 'single source of truth' principle already used for
-    prepare_export's point tracking, for the same reason: two
-    independent reimplementations of a crop/rotate transform have
-    drifted apart before in this project) and then offset by
-    (dst_row_offset, dst_col_offset). Points outside the selection are
-    returned completely unchanged — moving one piece of terrain must not
-    silently drag along a town that happens to sit elsewhere on the map.
+    (the same "single source of truth" principle used for
+    prepare_export's point tracking, so the raster transform and the
+    point transform cannot drift apart after an independent change to
+    either one) and then offset by (dst_row_offset, dst_col_offset).
+    Points outside the selection are returned completely unchanged —
+    moving one piece of terrain must not silently drag along a feature
+    that happens to sit elsewhere on the map.
 
     points_rc: list of (row, col) tuples (or None entries, passed through
     unchanged) in the raster's pixel coordinates. Returns a new list,
@@ -338,11 +336,9 @@ def inpaint_fill_windowed(dem: np.ndarray, hole_mask: np.ndarray, iterations: in
     (bounding box + margin) instead of the whole DEM.
 
     The iterative solver's cost grows with the size of the area it runs
-    on: running it on the whole canvas when the selection is small (an
-    island on a huge regional mosaic) is needlessly slow — this is
-    exactly what used to cause the interface freeze. Here the
-    computation is instead limited to a box sized to the selection, so it
-    stays fast regardless of how large the loaded DEM is."""
+    on. Restricting it to a box sized to the selection, instead of the
+    whole DEM, keeps the cost proportional to the size of the edit
+    rather than the size of the loaded data."""
     if margin is None:
         margin = max(feather_px * 3, 15)
     bbox = _bbox_of_mask(hole_mask, margin, dem.shape)
@@ -453,22 +449,20 @@ def delete_region(dem: np.ndarray, selection_mask: np.ndarray,
 
 
 # ------------------------------------------------------------------------
-# Elevation -> SC4 grayscale encoding — VALUES AND FORMULA VERIFIED
-# AGAINST SC4MAPPER'S REAL SOURCE CODE (app.py, class CreateRgnFromFile
-# and method CreateRgnFromGrey):
-#   - the 'scale factor' presets are these exact values (the 'scales'
-#     dictionary in app.py, function GetImageFactor), not a freely
-#     chosen 'meters per level' value as assumed in an earlier version
-#     of this plugin;
-#   - the conversion formula is LINEAR FROM ZERO, with no sea-level
-#     offset subtracted beforehand: elevation_m = grayscale * scale
-#     (from app.py, around line 1421 'r * (10*scale)', and from the
-#     0.1m precision of the SC4M format documented in doc/readme.html:
-#     the internal value is in tenths of a meter, so /10 gives meters);
-#   - SC4Mapper's 'sea level' (waterLevel) is hardcoded to 250
-#     internally (app.py line 2043) and is NOT editable in the
-#     scale-factor selection window: it's used elsewhere (rendering /
-#     flooding city edges), not inside this conversion formula.
+# Elevation -> SC4 grayscale encoding
+#
+# Values and formula verified against SC4Mapper's source (app.py, class
+# CreateRgnFromFile, method CreateRgnFromGrey):
+#   - The 'scale factor' presets below are SC4Mapper's own values (the
+#     'scales' dictionary in app.py, function GetImageFactor).
+#   - The conversion is linear from zero, with no sea-level offset:
+#     elevation_m = grayscale * scale (app.py, ~line 1421: 'r * (10 *
+#     scale)'; the SC4M format documentation notes 0.1 m precision, so
+#     the internal value is in tenths of a meter and /10 gives meters).
+#   - SC4Mapper's water level (waterLevel) is hardcoded to 250 internally
+#     (app.py, line 2043) and is not exposed in the scale-factor
+#     selection window; it affects rendering and city-edge flooding, not
+#     this conversion formula.
 # ------------------------------------------------------------------------
 
 SC4MAPPER_SCALE_FACTORS = {
@@ -487,21 +481,17 @@ def elevation_to_sc4_gray(elev_m: np.ndarray, scale_factor: float,
     sea level) are clipped to 0, since the same formula in SC4Mapper has
     no way to represent them.
 
-    coastal_offset_m: added to elev_m BEFORE encoding, to push low-lying
-    coastal land above SC4Mapper's own fixed water-rendering threshold.
-    Verified against the source code: SC4Mapper's water/land rendering
-    (terrain.py, onePassColors: 'water = H < waterLevel') compares the
-    RAW height buffer written into the actual game file
-    (region.py, City.Save: 'self.heightMap.tobytes()', no further
+    coastal_offset_m: added to elev_m before encoding, to push low-lying
+    coastal land above SC4Mapper's water-rendering threshold. SC4Mapper's
+    water/land rendering (terrain.py, onePassColors: 'water = H <
+    waterLevel') compares the raw height buffer written into the game
+    file (region.py, City.Save: 'self.heightMap.tobytes()', no further
     conversion) against a hardcoded waterLevel=250 (app.py, line 2043).
     Since that raw buffer equals grayscale*10*scale_factor (app.py,
-    ~line 1421), the water condition reduces to
-    'elevation_m < 250/10 = 25', REGARDLESS of the chosen scale_factor:
-    any exported land below 25 real meters renders as submerged in
-    SC4Mapper (and in the actual saved region, since the raw buffer is
-    written unchanged). This is a real, code-verified SC4Mapper
-    behavior, not a bug in this formula — coastal_offset_m is an
-    optional way to compensate for it if you don't want that effect."""
+    ~line 1421), the water condition reduces to elevation_m < 25,
+    independent of the chosen scale_factor: any exported land below 25
+    real meters renders as submerged in SC4Mapper. coastal_offset_m
+    compensates for this by shifting the encoded elevation range."""
     gray = np.round((elev_m + coastal_offset_m) / scale_factor)
     return np.clip(gray, 0, 255).astype(np.uint8)
 
@@ -576,17 +566,13 @@ def find_optimal_rotation(mask: np.ndarray, angle_step: float = 1.0, max_points:
     diagonal coastline to an export rectangle's edges, reducing wasted
     sea at the corners without manual trial and error.
 
-    IMPORTANT for performance: uses at most max_points points
-    (subsampled at regular intervals if the number of land pixels
-    exceeds it), not EVERY land pixel. The first version of this
-    function worked on every land pixel's coordinates: on a large
-    mosaic (all of Calabria can have hundreds of millions of land
-    pixels) this meant repeating a huge computation for 180 candidate
-    angles — a real, concrete cause of interface freezes encountered in
-    practice. To estimate the outline's general shape, a sample of
-    ~20,000 points is more than enough: the result doesn't change
-    appreciably, only the speed does (from minutes to fractions of a
-    second).
+    Performance: uses at most max_points points (subsampled at regular
+    intervals if the number of land pixels exceeds it), not every land
+    pixel. A large regional mosaic can contain hundreds of millions of
+    land pixels, and this search evaluates 180 candidate angles;
+    subsampling keeps the cost bounded regardless of mosaic size, since a
+    few thousand points are enough to estimate the outline's general
+    shape without materially changing the result.
 
     Returns (angle_degrees, bbox_area_at_that_angle). Angle in the same
     clockwise convention as rotate_crop/rotate_full."""
@@ -646,11 +632,10 @@ def prepare_export(dem: np.ndarray, sea_level: float = 0.0, rotation_degrees: fl
     coordinates) through every single step of that pipeline.
 
     This exists so that markers placed on the exported image (e.g. town
-    positions for the OpenTTD JSON export) are GUARANTEED to line up
-    with the actual pixel data: reimplementing the same crop/rotate/crop
-    sequence a second time in a different function would risk the two
-    drifting apart after a future change to one but not the other — a
-    real class of bug already hit more than once in this project.
+    positions for the OpenTTD JSON export) stay consistent with the
+    actual pixel data: a second, independent implementation of the same
+    crop/rotate/crop sequence could drift out of sync with this one after
+    a future change to either.
 
     resample_fn: callable(array2d, target_w, target_h) -> resampled
     array2d, used ONLY for the optional pre-rotation downsample
@@ -760,11 +745,11 @@ def rotate_full(dem: np.ndarray, angle_degrees: float, center_yx=None) -> np.nda
 
     center_yx: if the content isn't centered in the array (e.g. because
     the rotation safety margin got clipped asymmetrically on one side —
-    see autocrop_to_content_rotation_safe), the content's TRUE center
-    must be passed explicitly, otherwise the rotation happens around the
-    wrong point and cuts away real land (real bug encountered: with a
-    small angle like -3.9° on content close to the loaded DEM's edge,
-    the cut ran halfway across the mainland).
+    see autocrop_to_content_rotation_safe), the content's true center
+    must be passed explicitly. Using the array's geometric center instead
+    rotates around the wrong point and cuts away real land, even for
+    small rotation angles, when the content sits near the original DEM's
+    edge.
 
     WARNING: rotates WITHIN the same canvas passed in, without
     enlarging it — if the content (e.g. an elongated shape) extends
@@ -812,12 +797,11 @@ def autocrop_to_content_rotation_safe(dem: np.ndarray, sea_level: float = 0.0,
     rotation at export time.
 
     Returns (padded_array, padded_bbox, content_true_center). The true
-    center must ALWAYS be passed to rotate_full(..., center_yx=...): if
+    center must always be passed to rotate_full(..., center_yx=...): if
     the margin ends up clipped asymmetrically on one side (because the
     content touches the original DEM's edge), the padded crop's
-    geometric center no longer coincides with the content's true center
-    — using the wrong one cuts away real land during rotation (real bug
-    encountered and fixed)."""
+    geometric center no longer coincides with the content's true center,
+    and rotating around the wrong point cuts away real land."""
     if abs(rotation_degrees) < 1e-6:
         cropped, bbox = autocrop_to_content(dem, sea_level, margin_px=0)
         if bbox is None:
@@ -870,16 +854,14 @@ def compute_export_bbox_corners(dem: np.ndarray, sea_level: float = 0.0,
     preview of the result (e.g. as an outline on the QGIS canvas)
     BEFORE actually exporting, without having to generate the file.
 
-    IMPORTANT for performance: with a nonzero rotation, this does NOT
-    use rotate_full on the whole crop (which would do a pixel-by-pixel
-    bilinear resampling over a potentially huge area — the same class of
-    freeze already fixed for 'Find optimal angle'). For a preview, it's
-    enough to know WHERE the land pixels end up after rotation, not
-    their values: so only the COORDINATES of a sample of land pixels
-    (up to max_points) are rotated, an operation orders of magnitude
-    lighter. The real export (_prepare_export_array) still uses
-    rotate_full for the actual values, where pixel-perfect accuracy
-    matters; here only preview speed matters.
+    Performance: with a nonzero rotation, this does not call rotate_full
+    on the whole crop, which would perform a pixel-by-pixel bilinear
+    resampling over a potentially large area. For a preview, only the
+    coordinates of a sample of land pixels (up to max_points) need to be
+    rotated to know where they end up — the actual pixel values aren't
+    needed for this purpose. The real export (_prepare_export_array)
+    still uses rotate_full for the final pixel values, where accuracy
+    matters more than speed.
 
     If rotation_degrees is nonzero, the returned rectangle is itself
     rotated (the 4 corners no longer form an axis-aligned rectangle in

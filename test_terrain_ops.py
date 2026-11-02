@@ -154,7 +154,7 @@ def test_sc4_encoding_and_scale_suggestion():
 
 
 def test_sc4_water_threshold_and_coastal_offset():
-    # Verifies the water-rendering threshold discovered in SC4Mapper's
+    # Verifies the water-rendering threshold documented in SC4Mapper's
     # source code (terrain.py's onePassColors: 'water = H < waterLevel',
     # with waterLevel=250 hardcoded in app.py and the raw height buffer
     # written unchanged to the actual game file equal to
@@ -167,7 +167,7 @@ def test_sc4_water_threshold_and_coastal_offset():
     gray_no_offset = elevation_to_sc4_gray(elev, scale, coastal_offset_m=0.0)
     reconstructed_no_offset = gray_no_offset.astype(np.float64) * scale
     # without an offset, elevations well below the 25m threshold are
-    # still encoded (my formula has no lower bound of its own), but
+    # still encoded (this formula has no lower bound of its own), but
     # SC4Mapper's own fixed threshold would still show them as sea
     assert reconstructed_no_offset[0] < SC4MAPPER_WATER_THRESHOLD_M
 
@@ -264,10 +264,9 @@ def test_rotation_safe_bbox_bigger_than_normal_when_rotating():
 
 
 def test_rotation_safe_bbox_scales_with_angle_not_worst_case():
-    # VERY elongated selection (like a chain of islands): the old code
-    # always used the worst-case margin (90°) for ANY nonzero angle — a
-    # real, concrete cause of freezes encountered with small rotations
-    # (5°) on elongated selections
+    # A very elongated selection (like a chain of islands): a
+    # worst-case margin (as if rotating by 90°) applied for any nonzero
+    # angle wastes a large amount of padding on small rotation angles
     mask = np.zeros((6000, 6000), dtype=bool)
     mask[2750:3250, 500:5500] = True  # 500 x 5000 px
 
@@ -647,12 +646,11 @@ def test_compute_export_bbox_corners_matches_exact_rotate_full():
     # direct comparison against the "exact" method (actually rotates the
     # array), which to be correct must use
     # autocrop_to_content_rotation_safe (with margin) BEFORE rotating —
-    # otherwise rotate_full would cut away part of the content (real bug
-    # discovered while writing this very comparison: without the margin,
-    # up to 20% of the mass was lost). With the correct margin, the fast
-    # method (point-based) and the exact one must come out close —
-    # comparing the quadrilateral's TRUE area (shoelace), not the
-    # axis-aligned bounding box of its 4 corners (which would always
+    # without the margin, rotate_full cuts away part of the content (see
+    # test_rotate_full_without_padding_clips_content). With the correct
+    # margin, the fast method (point-based) and the exact one must come
+    # out close — comparing the quadrilateral's TRUE area (shoelace), not
+    # the axis-aligned bounding box of its 4 corners (which would always
     # overestimate, being tilted).
     dem = np.zeros((700, 700), dtype=np.float64)
     dem[300:400, 150:550] = 400.0
@@ -676,10 +674,10 @@ def test_compute_export_bbox_corners_matches_exact_rotate_full():
 
 
 def test_rotate_full_without_padding_clips_content():
-    # explicitly documents the discovered bug: rotate_full on a crop
-    # WITHOUT a margin loses content. Meant to prevent someone from
-    # accidentally removing the safety margin in _prepare_export_array
-    # in the future.
+    # documents the effect that motivates autocrop_to_content_rotation_safe:
+    # rotate_full on a crop WITHOUT a margin loses content. Meant to
+    # prevent someone from accidentally removing the safety margin in
+    # _prepare_export_array in the future.
     dem = np.zeros((500, 500), dtype=np.float64)
     dem[200:300, 50:450] = 400.0
     dem[200:400, 380:450] = 400.0
@@ -700,16 +698,14 @@ def test_rotate_full_without_padding_clips_content():
 
 
 def test_rotate_full_center_correct_when_content_near_edge():
-    # reproduces EXACTLY the scenario of the bug reported in practice: a
-    # small angle (here 4°, like the -3.9° encountered) on content that
-    # touches the original DEM's edge, such that the rotation safety
-    # margin ends up clipped ASYMMETRICALLY on one side. Verified via
-    # translation invariance: the same shape, rotated by the same angle,
-    # must give the same result (same mass, same dimensions) whether it
-    # sits comfortably at the center of a large DEM or is pushed against
-    # the edge of a smaller one — if the rotation center were wrong for
-    # the 'near the edge' case, the result would differ (real land cut
-    # away).
+    # A small rotation angle on content that touches the original DEM's
+    # edge, such that the rotation safety margin ends up clipped
+    # ASYMMETRICALLY on one side. Verified via translation invariance:
+    # the same shape, rotated by the same angle, must give the same
+    # result (same mass, same dimensions) whether it sits comfortably at
+    # the center of a large DEM or is pushed against the edge of a
+    # smaller one — if the rotation center were wrong for the 'near the
+    # edge' case, the result would differ (real land cut away).
     shape_h, shape_w = 120, 300
     angle = 4.0
 

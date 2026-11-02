@@ -94,8 +94,7 @@ class Sc4TerrainComposerDock(QDockWidget):
         # reopened) is removed right away, not just hidden from the list —
         # otherwise it stays selectable as if it were a raw tile, and if it
         # still carries the effects of an earlier mistaken operation it
-        # contaminates the next mosaic from the very first load (real bug
-        # encountered)
+        # would contaminate the next mosaic from the very first load
         self._remove_orphaned_working_layers()
 
         # the list of available DEMs stays up to date automatically
@@ -126,11 +125,9 @@ class Sc4TerrainComposerDock(QDockWidget):
         tabs.addTab(self._build_tab_openttd(), "6. OpenTTD")
 
         # Explicit stylesheet instead of inheriting QGIS's theme: some
-        # dark QGIS themes have shown buttons with invisible text (text
-        # color too close to the inherited background) — without a live
-        # QGIS to reproduce and diagnose this with certainty, the most
-        # robust fix is to not depend on the inherited theme and fix
-        # readable colors/contrast explicitly for the whole panel.
+        # dark QGIS themes can render buttons with text color too close to
+        # the inherited background. Fixing colors and contrast explicitly
+        # for the whole panel avoids depending on the active theme.
         tabs.setStyleSheet("""
             QPushButton {
                 color: #f0f0f0;
@@ -624,10 +621,8 @@ class Sc4TerrainComposerDock(QDockWidget):
                 # closed/reopened, an old 'Working DEM' — possibly already
                 # damaged by a previous operation — can remain in the QGIS
                 # project and show up as if it were just another raw tile.
-                # Selecting it by mistake together with clean tiles
-                # contaminates the mosaic from the very first load (real
-                # bug encountered: DEM already skewed/split right after
-                # loading).
+                # Selecting it by mistake together with clean tiles would
+                # contaminate the mosaic from the very first load.
                 continue
             item = QListWidgetItem(lyr.name())
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -664,9 +659,8 @@ class Sc4TerrainComposerDock(QDockWidget):
             # reprojects ONLY if actually needed (tiles with different
             # CRSs from each other, or not already projected/metric): if
             # they're all already in the same metric CRS (the common case
-            # of TINITALY-only tiles), no reprojection is applied —
-            # applying it when not needed used to cause a slightly tilted
-            # mosaic (real bug encountered)
+            # of TINITALY-only tiles), no reprojection is applied,
+            # avoiding a slight tilt in the resulting mosaic
             epsg = mosaic_tiles_auto_utm(paths, source_path)
         except Exception as e:
             QMessageBox.critical(self, "Error",
@@ -805,17 +799,15 @@ class Sc4TerrainComposerDock(QDockWidget):
             # ALWAYS clear the layer at the start of a new lasso session:
             # if a polygon from a previous selection were left there, it
             # would be included again on the next 'Apply selection' along
-            # with the new one (e.g. an already-deleted area 'reappearing'
-            # moved together with the next selection — real bug
-            # encountered)
+            # with the new one (e.g. an already-deleted area reappearing,
+            # moved together with the next selection)
             self._clear_manual_layer()
 
         # 'Apply selection' ALWAYS gives priority to selected blobs, if
         # there are any: if a blob selection from a previous session had
-        # been left active, the freshly drawn lasso would be silently
-        # ignored (exactly the reported bug: 'the lasso doesn't work'
-        # after using the blobs). Clearing the blob selection here means
-        # switching to the lasso always takes effect.
+        # been left active, a freshly drawn lasso would be silently
+        # ignored. Clearing the blob selection here means switching to
+        # the lasso always takes effect.
         if self.blob_layer is not None:
             self.blob_layer.removeSelection()
 
@@ -974,10 +966,8 @@ class Sc4TerrainComposerDock(QDockWidget):
                 bboxes.append(dst_bbox)
 
         if dst_bbox is None:
-            # nothing to move would end up inside the canvas: it used to
-            # fail silently (no error, no effect) — now it's reported
-            # explicitly instead of everything just disappearing without
-            # explanation
+            # nothing to move would end up inside the canvas: report this
+            # explicitly instead of failing silently with no visible effect
             QMessageBox.warning(
                 self, "Destination outside the canvas",
                 "The clicked point, converted to the working raster's "

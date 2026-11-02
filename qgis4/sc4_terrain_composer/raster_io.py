@@ -143,10 +143,7 @@ def mosaic_tiles_auto_utm(paths, out_path: str, resample_alg: str = "near"):
     that CRS. Reprojecting when it isn't needed introduces a slight
     misalignment (an automatically computed UTM zone's 'north' is never
     perfectly identical to the tiles' original zone, especially near
-    zone boundaries), visible as a tilted mosaic — real bug encountered:
-    before this automatic reprojection was introduced, a mosaic of
-    TINITALY-only tiles came out as a perfect rectangle; afterwards, it
-    was tilted.
+    zone boundaries), which shows up as a tilted mosaic.
 
     Reprojection (to the UTM zone best suited to the area's centroid) is
     applied ONLY when actually needed: tiles with different CRSs from
@@ -218,11 +215,10 @@ def save_uint8_bmp(array: np.ndarray, out_path: str):
 
     Reason: SC4Mapper opens the file with Pillow (Image.open) and shows
     the generic error 'This is not a valid file' if that open fails for
-    ANY reason (verified in SC4Mapper's source code, app.py,
-    OnBrowseFile) — real bug encountered: GDAL's BMP driver is fairly
-    old and can write format variants that Pillow doesn't reliably read.
-    Writing the file by hand in a minimal, widely standard BMP format
-    removes the risk of incompatibility."""
+    any reason (see SC4Mapper's source, app.py, OnBrowseFile). GDAL's BMP
+    driver is fairly old and can write format variants that Pillow
+    doesn't reliably read. Writing the file by hand in a minimal, widely
+    standard BMP format removes that risk."""
     h, w = array.shape
     arr = np.ascontiguousarray(array, dtype=np.uint8)
 
